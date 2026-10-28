@@ -223,11 +223,15 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
                                                       column_checksums,
                                                       column_count,
                                                       data_format_version))) {
+        // Back off between attempts only; a successful report is committed
+        // already and every index build used to pay this sleep on success.
+        if (retry_cnt > 1) {
+          ob_usleep(100L * 1000L);
+        }
       } else {
         break;
       }
     }
-    ob_usleep(100L * 1000L);
   }
   return ret;
 }
