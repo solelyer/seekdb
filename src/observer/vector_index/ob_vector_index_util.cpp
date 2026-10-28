@@ -37,6 +37,7 @@
 #include "storage/allocator/ob_shared_memory_allocator_mgr.h"
 #include "share/roaringbitmap/ob_rb_memory_mgr.h"
 #include "lib/file/ob_string_util.h"
+#include "lib/vector/ob_hipvs_bridge.h"
 #include "share/object/ob_array_cast.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 
@@ -51,6 +52,13 @@ using schema::ObIndexType;
 using schema::ObPartitionLevel;
 using schema::ObSchemaGetterGuard;
 using schema::ObTableSchema;
+
+static_assert(static_cast<int>(ObVectorIndexAlgorithmLib::VIAL_VSAG) == obhipvs::LIB_VSAG,
+              "ObVectorIndexAlgorithmLib and obhipvs::LibType must stay in sync");
+static_assert(static_cast<int>(ObVectorIndexAlgorithmLib::VIAL_OB) == obhipvs::LIB_OB,
+              "ObVectorIndexAlgorithmLib and obhipvs::LibType must stay in sync");
+static_assert(static_cast<int>(ObVectorIndexAlgorithmLib::VIAL_HIPVS) == obhipvs::LIB_HIPVS,
+              "ObVectorIndexAlgorithmLib and obhipvs::LibType must stay in sync");
 
 int ObVectorIndexUtil::get_vector_index_prefix(
     const schema::ObTableSchema &index_table_schema,
@@ -257,6 +265,8 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_VSAG;
           } else if (new_param_value == "OB") {
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_OB;
+          } else if (new_param_value == "HIPVS") {
+            param.lib_ = ObVectorIndexAlgorithmLib::VIAL_HIPVS;
           } else {
             ret = OB_NOT_SUPPORTED;
           }
@@ -1030,6 +1040,8 @@ int ObVectorIndexUtil::construct_rebuild_index_param(
         tmp_lib = ObString("VSAG");
       } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_OB) {
         tmp_lib = ObString("OB");
+      } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_HIPVS) {
+        tmp_lib = ObString("HIPVS");
       } else {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -2990,8 +3002,12 @@ int ObVectorIndexUtil::check_index_param(
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "this type of vector index distance algorithm is");
           }
         } else if (last_variable == "LIB") {
-          if (new_parser_name == "VSAG" ||
-              new_parser_name == "OB") {
+          if (new_parser_name == "HIPVS" && is_sparse_vec) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "hipvs lib for sparse vector index is");
+          } else if (new_parser_name == "VSAG" ||
+              new_parser_name == "OB" ||
+              new_parser_name == "HIPVS") {
             lib_is_set = true;
             lib_name = new_parser_name;
           } else {
@@ -3293,9 +3309,28 @@ int ObVectorIndexUtil::check_index_param(
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index m is");
         }
         if (OB_FAIL(ret)) {
-        } else if (lib_is_set && lib_name != "VSAG") {
+        } else if (lib_is_set && lib_name != "VSAG" && lib_name != "HIPVS") {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' is");
+        }
+        if (OB_FAIL(ret)) {
+        } else if (lib_is_set && lib_name == "HIPVS" && !type_hnsw_is_set) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "LIB=HIPVS only supporting TYPE=HNSW, this value of vector index type is");
+        } else if (lib_is_set && lib_name == "HIPVS"
+                   && (type_hnsw_sq_is_set || type_hnsw_bq_is_set)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "LIB=HIPVS with vector quantization type is");
+        } else if (lib_is_set && lib_name == "HIPVS" && type_hybrid_vec_is_set) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "LIB=HIPVS with hybrid vector index is");
+        }
+        if (OB_FAIL(ret)) {
+        } else if (lib_is_set && lib_name == "HIPVS" && !obhipvs::capability().available) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("hipvs backend is not available for this index", K(ret),
+                   KCSTRING(obhipvs::capability().message), K(obhipvs::capability().compiled));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "LIB=HIPVS requiring a working HIP device, the current node is");
         }
         if (OB_FAIL(ret)) {
         } else if (ef_construction_value <= m_value) {
@@ -5116,7 +5151,8 @@ int ObVectorIndexUtil::estimate_hnsw_memory(uint64_t num_vectors,
                                                 param.extra_info_actual_size_,
                                                 param.refine_type_,
                                                 param.bq_bits_query_,
-                                                param.bq_use_fht_))) {
+                                                param.bq_use_fht_,
+                                                param.lib_))) {
   } else if (OB_ISNULL(index_handler)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FALSE_IT(est_mem = obvectorutil::estimate_memory(index_handler, num_vectors, is_build))) {
@@ -5515,7 +5551,8 @@ int ObVectorIndexUtil::estimate_vector_memory_used(
                                            param.extra_info_actual_size_,
                                            param.refine_type_,
                                            param.bq_bits_query_,
-                                           param.bq_use_fht_))) {
+                                           param.bq_use_fht_,
+                                           param.lib_))) {
     } else if (OB_ISNULL(index_handler)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FALSE_IT(estimate_memory = obvectorutil::estimate_memory(index_handler, row_count, true/*is_build*/))) {

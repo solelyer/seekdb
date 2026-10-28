@@ -459,6 +459,7 @@ OBLIB_UNITY_GROUPS = {
             srcs = [
                 "src/oblib/lib/vector/ob_vector_util.cpp",
                 "src/oblib/lib/vector/ob_vsag_adaptor.cpp",
+                "src/oblib/lib/vector/ob_hipvs_bridge.cpp",
             ],
             generated_srcs = [
             ],

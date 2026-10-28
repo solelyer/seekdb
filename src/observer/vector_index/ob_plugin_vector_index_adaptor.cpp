@@ -793,7 +793,8 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                       param->extra_info_actual_size_,
                                                       param->refine_type_,
                                                       param->bq_bits_query_,
-                                                      param->bq_use_fht_))) {
+                                                      param->bq_use_fht_,
+                                                      param->lib_))) {
         }
       }
       if (OB_FAIL(ret)) {
@@ -879,7 +880,8 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                param->extra_info_actual_size_,
                                                param->refine_type_,
                                                param->bq_bits_query_,
-                                               param->bq_use_fht_))) {
+                                               param->bq_use_fht_,
+                                               param->lib_))) {
         }
       }
 
@@ -936,7 +938,8 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
                                              param->extra_info_actual_size_,
                                              param->refine_type_,
                                              param->bq_bits_query_,
-                                             param->bq_use_fht_))) {
+                                             param->bq_use_fht_,
+                                             param->lib_))) {
       }
     }
 
@@ -1824,7 +1827,8 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
                                              param->extra_info_actual_size_,
                                              param->refine_type_,
                                              param->bq_bits_query_,
-                                             param->bq_use_fht_))) {
+                                             param->bq_use_fht_,
+                                             param->lib_))) {
       } else if (OB_FAIL(obvectorutil::build_index(snap_data_->index_,
                                                    vec_array->get_data(),
                                                    vid_array->get_data(),
@@ -2036,7 +2040,8 @@ int ObPluginVectorIndexAdaptor::check_snap_hnswsq_index()
                                              param->extra_info_actual_size_,
                                              param->refine_type_,
                                              param->bq_bits_query_,
-                                             param->bq_use_fht_))) {
+                                             param->bq_use_fht_,
+                                             param->lib_))) {
       } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_,
                                                  vec_array->get_data(),
                                                  vid_array->get_data(),

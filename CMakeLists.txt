@@ -31,6 +31,7 @@ endif()
 
 option(OB_ENABLE_STANDBY "Build physical standby support" ON)
 option(ENABLE_SANITY "Build with seekdb memory Sanity instrumentation" OFF)
+option(OB_USE_HIPVS "Build the hipVS (AMD ROCm cuVS) vector index backend" OFF)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(SEEKDB_GENERATED_ROOT "${CMAKE_BINARY_DIR}/generated")

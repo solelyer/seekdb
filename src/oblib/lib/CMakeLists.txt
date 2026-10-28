@@ -146,3 +146,47 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
   endif()
 endif()
+
+# Optional hipVS (AMD ROCm cuVS) backend for the vector index. Everything stays
+# out of the default build: LIB=HIPVS indexes fail fast with OB_NOT_SUPPORTED
+# unless seekdb was configured with -DOB_USE_HIPVS=ON and a device is present.
+if(OB_USE_HIPVS)
+  if(WIN32 OR APPLE)
+    message(FATAL_ERROR "OB_USE_HIPVS is only supported on Linux with an AMD ROCm toolchain")
+  endif()
+  ob_define(OB_HIPVS_DIR "/opt/rocm")
+  set(OB_HIPVS_DLPACK_INCLUDE "" CACHE PATH "Directory that contains dlpack/dlpack.h")
+  find_path(OB_HIPVS_DLPACK_INCLUDE dlpack/dlpack.h
+    PATHS
+      "${OB_HIPVS_DLPACK_INCLUDE}"
+      "${OB_HIPVS_DIR}/include"
+      "${OB_HIPVS_DIR}/include/cuvs"
+    NO_DEFAULT_PATH)
+  find_library(OB_CUVS_C_LIBRARY NAMES cuvs_c
+    PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
+  find_library(OB_CUVS_LIBRARY NAMES cuvs
+    PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
+  find_library(OB_AMD_HIP_LIBRARY NAMES amdhip64
+    PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
+  if(NOT EXISTS "${OB_HIPVS_DIR}/include/cuvs/neighbors/cagra.h")
+    message(FATAL_ERROR "hipVS C API headers not found under ${OB_HIPVS_DIR}, pass -DOB_HIPVS_DIR=<prefix>")
+  endif()
+  if(NOT OB_HIPVS_DLPACK_INCLUDE)
+    message(FATAL_ERROR "dlpack/dlpack.h not found, pass -DOB_HIPVS_DLPACK_INCLUDE=<dir>")
+  endif()
+  if(NOT OB_CUVS_C_LIBRARY)
+    message(FATAL_ERROR "libcuvs_c not found under ${OB_HIPVS_DIR}/lib, check the hipVS installation")
+  endif()
+  target_compile_definitions(oblib_lib PRIVATE OB_USE_HIPVS __HIP_PLATFORM_AMD__)
+  target_include_directories(oblib_lib PRIVATE
+    "${OB_HIPVS_DIR}/include"
+    "${OB_HIPVS_DLPACK_INCLUDE}")
+  target_link_libraries(oblib_lib PUBLIC "${OB_CUVS_C_LIBRARY}")
+  if(OB_CUVS_LIBRARY)
+    target_link_libraries(oblib_lib PUBLIC "${OB_CUVS_LIBRARY}")
+  endif()
+  if(OB_AMD_HIP_LIBRARY)
+    target_link_libraries(oblib_lib PUBLIC "${OB_AMD_HIP_LIBRARY}")
+  endif()
+  message(STATUS "seekdb hipVS backend enabled: ${OB_HIPVS_DIR}")
+endif()
