@@ -58,6 +58,8 @@ constexpr uint32_t HIPVS_STREAM_VERSION = 1;
 // enough rows to return.
 constexpr int64_t FILTER_OVERFETCH = 4;
 constexpr int64_t MAX_SEARCH_CANDIDATES = 65536;
+// Largest candidate list the single-CTA CAGRA search kernel accepts.
+constexpr int64_t MAX_SINGLE_CTA_ITOPK = 512;
 // Below this many rows the host side linear scan is cheaper than a GPU build
 // and IVF-PQ, the CAGRA graph builder, is not meant for toy datasets.
 constexpr int64_t MIN_GRAPH_ROWS = 1024;
@@ -1325,6 +1327,12 @@ int device_search_window(CagraIndex *index, const float *query, int64_t window,
         // retained candidate list and the beam width follows its magnitude.
         params->search_width = static_cast<size_t>(
             ef_search >= 128 ? 4 : (ef_search >= 32 ? 2 : 1));
+        // AUTO keeps choosing the single-CTA kernel for one query even when
+        // it cannot hold the list (EF_SEARCH > 256, wide filtered windows),
+        // which then fails with "itopk_size cannot be larger than 512".
+        if (itopk > MAX_SINGLE_CTA_ITOPK) {
+          params->algo = MULTI_CTA;
+        }
         cuvsFilter filter;
         filter.addr = 0;
         filter.type = NO_FILTER;
