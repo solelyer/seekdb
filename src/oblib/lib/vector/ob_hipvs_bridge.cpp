@@ -812,6 +812,42 @@ int extend_graph(CagraIndex *index, int64_t old_count, int64_t count)
   return run_on_gpu_thread(extend_graph_impl, &task);
 }
 
+struct LoadGraphTask {
+  CagraIndex *index_;
+  uint32_t *graph_;
+  uint32_t graph_degree_;
+};
+
+// Rebuilds the CAGRA index from a deserialized graph and the host dataset.
+int load_graph_impl(void *arg)
+{
+  int ret = OB_SUCCESS;
+  LoadGraphTask *task = static_cast<LoadGraphTask *>(arg);
+  CagraIndex *index = task->index_;
+  int64_t dataset_shape[2] = {0, 0};
+  int64_t graph_shape[2] = {0, 0};
+  DLManagedTensor dataset_tensor;
+  DLManagedTensor graph_tensor;
+  fill_float_tensor(dataset_tensor, index->data_.data(), kDLCPU, index->count(),
+                    index->config_.dim, dataset_shape);
+  fill_u32_tensor(graph_tensor, task->graph_, kDLCPU, index->count(), task->graph_degree_,
+                  graph_shape);
+  if (index->cagra_ == nullptr
+      && OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_), "create cagra index"))) {
+  } else if (OB_FAIL(cuvs_errcode2ob(
+                 cuvsCagraIndexFromArgs(index->resources_, to_cuvs_metric(index->metric_code()),
+                                        &graph_tensor, &dataset_tensor, index->cagra_),
+                 "cagra index from args"))) {
+  } else {
+    index->built_ = true;
+  }
+  if (OB_FAIL(ret) && index->cagra_ != nullptr) {
+    cuvsCagraIndexDestroy(index->cagra_);
+    index->cagra_ = nullptr;
+  }
+  return ret;
+}
+
 #endif  // OB_USE_HIPVS
 
 int append_rows(CagraIndex *index, const float *vectors, const int64_t *ids, int64_t count,
@@ -1726,36 +1762,18 @@ int deserialize(CagraIndex *&index, std::istream &in)
             ret = OB_ALLOCATE_MEMORY_FAILED;
             LOG_WARN("hipvs allocate graph buffers failed", K(ret), KCSTRING(e.what()));
           }
-          if (OB_SUCC(ret) && index->cagra_ == nullptr
-              && OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_),
-                                         "create cagra index"))) {
-          }
           if (OB_SUCC(ret)
               && OB_FAIL(read_stream(in, host_graph.data(),
                                      count * graph_degree * sizeof(uint32_t)))) {
           }
           if (OB_SUCC(ret)) {
-            int64_t dataset_shape[2] = {0, 0};
-            int64_t graph_shape[2] = {0, 0};
-            DLManagedTensor dataset_tensor;
-            DLManagedTensor graph_tensor;
-            fill_float_tensor(dataset_tensor, index->data_.data(), kDLCPU, count, dim,
-                              dataset_shape);
-            fill_u32_tensor(graph_tensor, host_graph.data(), kDLCPU, count, graph_degree,
-                            graph_shape);
-            if (OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexFromArgs(index->resources_,
-                                                               to_cuvs_metric(
-                                                                   index->metric_code()),
-                                                               &graph_tensor, &dataset_tensor,
-                                                               index->cagra_),
-                                        "cagra index from args"))) {
-            } else {
-              index->built_ = true;
-            }
-          }
-          if (OB_FAIL(ret) && index->cagra_ != nullptr) {
-            cuvsCagraIndexDestroy(index->cagra_);
-            index->cagra_ = nullptr;
+            // Snapshots are loaded by query and background loader threads that
+            // run with the small OB stack, the same overflow risk as the build.
+            LoadGraphTask task;
+            task.index_ = index;
+            task.graph_ = host_graph.data();
+            task.graph_degree_ = graph_degree;
+            ret = run_on_gpu_thread(load_graph_impl, &task);
           }
         } else if (OB_SUCC(ret) && has_graph == 1) {
           ret = OB_INVALID_DATA;
