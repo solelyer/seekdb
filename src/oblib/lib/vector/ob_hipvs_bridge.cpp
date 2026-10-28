@@ -309,7 +309,8 @@ int run_on_gpu_thread(int (*fn)(void *), void *arg)
       int (*fn_)(void *);
       void *arg_;
       int ret_;
-    } task = {fn, arg, OB_ERR_UNEXPECTED};
+      int device_err_;
+    } task = {fn, arg, OB_ERR_UNEXPECTED, 0};
     pthread_attr_t attr;
     pthread_t tid;
     int pret = pthread_attr_init(&attr);
@@ -327,9 +328,7 @@ int run_on_gpu_thread(int (*fn)(void *), void *arg)
                              const cudaError_t err = cudaSetDevice(0);
                              if (err != cudaSuccess) {
                                t->ret_ = OB_ERR_UNEXPECTED;
-                               LOG_WARN("hipvs set device on gpu thread failed",
-                                        K(static_cast<int>(err)),
-                                        KCSTRING(cudaGetErrorString(err)));
+                               t->device_err_ = static_cast<int>(err);
                              } else {
                                t->ret_ = t->fn_(t->arg_);
                              }
@@ -340,10 +339,14 @@ int run_on_gpu_thread(int (*fn)(void *), void *arg)
       } else {
         pthread_join(tid, nullptr);
         ret = task.ret_;
+        if (task.device_err_ != 0) {
+          LOG_WARN("hipvs set device on gpu thread failed", K(task.device_err_),
+                   KCSTRING(cudaGetErrorString(static_cast<cudaError_t>(task.device_err_))));
+        }
       }
       pthread_attr_destroy(&attr);
     }
-    if (OB_FAIL(ret)) {
+    if (pret != 0) {
       LOG_WARN("hipvs run on gpu thread failed", K(ret), K(pret));
     }
   }
@@ -435,6 +438,7 @@ struct ExtendTask {
 // failure only degrades search to the linear scan.
 int extend_graph_impl(void *arg)
 {
+  int ret = OB_SUCCESS;
   ExtendTask *task = static_cast<ExtendTask *>(arg);
   CagraIndex *index = task->index_;
   cuvsCagraExtendParams_t params = nullptr;
