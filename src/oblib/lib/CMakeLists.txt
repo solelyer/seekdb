@@ -155,19 +155,30 @@ if(OB_USE_HIPVS)
     message(FATAL_ERROR "OB_USE_HIPVS is only supported on Linux with an AMD ROCm toolchain")
   endif()
   ob_define(OB_HIPVS_DIR "/opt/rocm")
+  ob_define(OB_ROCM_DIR "/opt/rocm")
   set(OB_HIPVS_DLPACK_INCLUDE "" CACHE PATH "Directory that contains dlpack/dlpack.h")
-  find_path(OB_HIPVS_DLPACK_INCLUDE dlpack/dlpack.h
-    PATHS
-      "${OB_HIPVS_DLPACK_INCLUDE}"
-      "${OB_HIPVS_DIR}/include"
-      "${OB_HIPVS_DIR}/include/cuvs"
-    NO_DEFAULT_PATH)
+  if(NOT OB_HIPVS_DLPACK_INCLUDE)
+    find_path(_ob_hipvs_dlpack_dir dlpack/dlpack.h
+      PATHS
+        "${OB_HIPVS_DIR}/include"
+        "${OB_HIPVS_DIR}/include/cuvs"
+        "${OB_ROCM_DIR}/include"
+      NO_DEFAULT_PATH)
+    if(_ob_hipvs_dlpack_dir)
+      set(OB_HIPVS_DLPACK_INCLUDE "${_ob_hipvs_dlpack_dir}" CACHE PATH
+        "Directory that contains dlpack/dlpack.h" FORCE)
+    endif()
+  endif()
   find_library(OB_CUVS_C_LIBRARY NAMES cuvs_c
     PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
   find_library(OB_CUVS_LIBRARY NAMES cuvs
     PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
   find_library(OB_AMD_HIP_LIBRARY NAMES amdhip64
-    PATHS "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64" NO_DEFAULT_PATH)
+    PATHS
+      "${OB_ROCM_DIR}/lib" "${OB_ROCM_DIR}/lib64"
+      "${OB_HIPVS_DIR}/lib" "${OB_HIPVS_DIR}/lib64"
+      "${OB_HIPVS_DIR}/lib/rocm" "${OB_HIPVS_DIR}/lib/rocm/lib"
+    NO_DEFAULT_PATH)
   if(NOT EXISTS "${OB_HIPVS_DIR}/include/cuvs/neighbors/cagra.h")
     message(FATAL_ERROR "hipVS C API headers not found under ${OB_HIPVS_DIR}, pass -DOB_HIPVS_DIR=<prefix>")
   endif()
@@ -180,6 +191,7 @@ if(OB_USE_HIPVS)
   target_compile_definitions(oblib_lib PRIVATE OB_USE_HIPVS __HIP_PLATFORM_AMD__)
   target_include_directories(oblib_lib PRIVATE
     "${OB_HIPVS_DIR}/include"
+    "${OB_ROCM_DIR}/include"
     "${OB_HIPVS_DLPACK_INCLUDE}")
   target_link_libraries(oblib_lib PUBLIC "${OB_CUVS_C_LIBRARY}")
   if(OB_CUVS_LIBRARY)
