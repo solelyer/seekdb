@@ -369,9 +369,14 @@ int build_graph_impl(CagraIndex *index)
     const size_t graph_degree = static_cast<size_t>(
         std::min<int64_t>(index->config_.graph_degree > 0 ? index->config_.graph_degree : 32,
                           max_degree));
-    const size_t intermediate_degree = static_cast<size_t>(
-        std::max<int64_t>(static_cast<int64_t>(graph_degree) * 2,
-                          index->config_.intermediate_graph_degree));
+    // ef_construction is the HNSW candidate list used while linking, the CAGRA
+    // equivalent is the degree of the graph that gets pruned to graph_degree.
+    const int64_t wanted_intermediate = std::max<int64_t>(
+        static_cast<int64_t>(graph_degree) * 2,
+        std::max<int64_t>(index->config_.intermediate_graph_degree,
+                          index->config_.ef_construction));
+    const size_t intermediate_degree = static_cast<size_t>(std::min<int64_t>(
+        std::max<int64_t>(wanted_intermediate, static_cast<int64_t>(graph_degree)), max_degree));
     cuvsCagraIndexParams_t params = nullptr;
     cuvsError_t err = cuvsCagraIndexParamsCreate(&params);
     if (OB_FAIL(cuvs_errcode2ob(err, "create cagra index params"))) {
@@ -988,10 +993,10 @@ int device_search_window(CagraIndex *index, const float *query, int64_t window,
         // wide as the window we are paging through. A beam wider than the
         // dataset only adds never filled slots, so clamp it to the row count.
         const int64_t itopk = std::min<int64_t>(
-            index->count(), std::max<int64_t>(window, ef_search > 0 ? ef_search : 64));
+            index->count(), std::max<int64_t>(window, (ef_search > 0 ? ef_search : 64) * 2));
         params->itopk_size = static_cast<size_t>(itopk);
-        // A single beam pass at the default width misses too many true
-        // neighbours, widen it along with ef_search.
+        // CAGRA keeps its own beam quality knobs, EF_SEARCH maps to the
+        // retained candidate list and the beam width follows its magnitude.
         params->search_width = static_cast<size_t>(
             ef_search >= 128 ? 4 : (ef_search >= 32 ? 2 : 1));
         cuvsFilter filter;
