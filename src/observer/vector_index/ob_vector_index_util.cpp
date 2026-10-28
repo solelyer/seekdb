@@ -265,7 +265,7 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_VSAG;
           } else if (new_param_value == "OB") {
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_OB;
-          } else if (new_param_value == "HIPVS") {
+          } else if (new_param_value == "HIPVS" || new_param_value == "CUVS") {
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_HIPVS;
           } else {
             ret = OB_NOT_SUPPORTED;
@@ -3002,14 +3002,16 @@ int ObVectorIndexUtil::check_index_param(
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "this type of vector index distance algorithm is");
           }
         } else if (last_variable == "LIB") {
-          if (new_parser_name == "HIPVS" && is_sparse_vec) {
+          if ((new_parser_name == "HIPVS" || new_parser_name == "CUVS") && is_sparse_vec) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "hipvs lib for sparse vector index is");
           } else if (new_parser_name == "VSAG" ||
               new_parser_name == "OB" ||
-              new_parser_name == "HIPVS") {
+              new_parser_name == "HIPVS" ||
+              new_parser_name == "CUVS") {
             lib_is_set = true;
-            lib_name = new_parser_name;
+            // CUVS is the spelling used by the hipVS reference DDL.
+            lib_name = new_parser_name == "CUVS" ? ObString("HIPVS") : new_parser_name;
           } else {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "this type of vector index lib is");
