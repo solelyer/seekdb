@@ -21,6 +21,7 @@ Required server side: seekdb built with -DOB_USE_HIPVS=ON for LIB=HIPVS.
 """
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -154,12 +155,16 @@ def run_queries(conn, table, queries, topk, metric, warmup, rounds):
 
 
 def recall_at_k(results, truth, topk):
-    if not results:
+    if not results or not truth:
         return 0.0
+    # Results hold every round, the ground truth is one set per query, so the
+    # truth has to be cycled instead of truncating the pairs at len(truth).
     hits = 0
-    for got, want in zip(results, truth):
+    pairs = 0
+    for got, want in zip(results, itertools.cycle(truth)):
         hits += len(got & want)
-    return hits / float(len(results) * topk)
+        pairs += 1
+    return hits / float(pairs * topk)
 
 
 class GpuSampler(threading.Thread):

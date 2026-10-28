@@ -990,6 +990,10 @@ int device_search_window(CagraIndex *index, const float *query, int64_t window,
         const int64_t itopk = std::min<int64_t>(
             index->count(), std::max<int64_t>(window, ef_search > 0 ? ef_search : 64));
         params->itopk_size = static_cast<size_t>(itopk);
+        // A single beam pass at the default width misses too many true
+        // neighbours, widen it along with ef_search.
+        params->search_width = static_cast<size_t>(
+            ef_search >= 128 ? 4 : (ef_search >= 32 ? 2 : 1));
         cuvsFilter filter;
         filter.addr = 0;
         filter.type = NO_FILTER;
