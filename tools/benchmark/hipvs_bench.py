@@ -23,6 +23,7 @@ Required server side: seekdb built with -DOB_USE_HIPVS=ON for LIB=HIPVS.
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -168,20 +169,20 @@ class GpuSampler(threading.Thread):
         super().__init__(daemon=True)
         self.samples = []
         self.error = None
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 out = os.popen("rocm-smi --showuse --showmemuse 2>/dev/null").read()
                 self.samples.append(out)
             except Exception as exc:  # pragma: no cover
                 self.error = str(exc)
                 return
-            self._stop.wait(1.0)
+            self._stop_event.wait(1.0)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=5)
 
     def summary(self):
@@ -190,7 +191,12 @@ class GpuSampler(threading.Thread):
             return {"available": False, "note": "rocm-smi produced no output"}
         gpu_use = []
         for line in text.splitlines():
-            if "%" in line and ("GPU use" in line or "GPU utilization" in line.lower()):
+            if "GPU use" in line or "GPU utilization" in line.lower():
+                # rocm-smi text output looks like "GPU[0] : GPU use (%): 17".
+                match = re.search(r"GPU use \(%\):\s*(\d+(?:\.\d+)?)", line)
+                if match:
+                    gpu_use.append(float(match.group(1)))
+                    continue
                 for token in line.replace("|", " ").split():
                     if token.endswith("%"):
                         try:

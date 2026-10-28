@@ -35,6 +35,8 @@
 #include "lib/utility/ob_print_utils.h"
 
 #ifdef OB_USE_HIPVS
+#include <pthread.h>
+
 #include <cuvs/core/c_api.h>
 #include <cuvs/distance/distance.h>
 #include <cuvs/neighbors/cagra.h>
@@ -290,7 +292,65 @@ void release_scratch(CagraIndex *index, CagraIndex::Scratch *scratch)
   }
 }
 
-int build_graph(CagraIndex *index)
+// OB worker threads, the DDL pool in particular, run with the configured
+// stack_size which defaults to 256KB. The cuVS CAGRA host side needs far more
+// than that, so GPU work is dispatched to a private thread with a generous
+// stack. tl_on_gpu_thread keeps nested calls (extend -> rebuild) inline.
+constexpr size_t HIPVS_GPU_STACK_SIZE = 64L * 1024 * 1024;
+thread_local bool tl_on_gpu_thread = false;
+
+int run_on_gpu_thread(int (*fn)(void *), void *arg)
+{
+  int ret = OB_SUCCESS;
+  if (tl_on_gpu_thread) {
+    ret = fn(arg);
+  } else {
+    struct Task {
+      int (*fn_)(void *);
+      void *arg_;
+      int ret_;
+    } task = {fn, arg, OB_ERR_UNEXPECTED};
+    pthread_attr_t attr;
+    pthread_t tid;
+    int pret = pthread_attr_init(&attr);
+    if (pret != 0) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      pret = pthread_attr_setstacksize(&attr, HIPVS_GPU_STACK_SIZE);
+      if (pret != 0) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (0 != (pret = pthread_create(
+                           &tid, &attr,
+                           [](void *p) -> void * {
+                             Task *t = static_cast<Task *>(p);
+                             tl_on_gpu_thread = true;
+                             const cudaError_t err = cudaSetDevice(0);
+                             if (err != cudaSuccess) {
+                               t->ret_ = OB_ERR_UNEXPECTED;
+                               LOG_WARN("hipvs set device on gpu thread failed",
+                                        K(static_cast<int>(err)),
+                                        KCSTRING(cudaGetErrorString(err)));
+                             } else {
+                               t->ret_ = t->fn_(t->arg_);
+                             }
+                             return nullptr;
+                           },
+                           &task))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        pthread_join(tid, nullptr);
+        ret = task.ret_;
+      }
+      pthread_attr_destroy(&attr);
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("hipvs run on gpu thread failed", K(ret), K(pret));
+    }
+  }
+  return ret;
+}
+
+int build_graph_impl(CagraIndex *index)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(index)) {
@@ -345,6 +405,82 @@ int build_graph(CagraIndex *index)
     }
   }
   return ret;
+}
+
+int build_graph_task(void *arg) { return build_graph_impl(static_cast<CagraIndex *>(arg)); }
+
+int build_graph(CagraIndex *index)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(index)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (index->count() < MIN_GRAPH_ROWS) {
+    // Empty or tiny index, keep the host side linear scan, nothing to build.
+    index->built_ = false;
+  } else {
+    ret = run_on_gpu_thread(build_graph_task, index);
+  }
+  return ret;
+}
+
+struct ExtendTask {
+  CagraIndex *index_;
+  const float *rows_;
+  int64_t count_;
+  int64_t old_count_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// Always succeeds: the rows are already stored on the host, any GPU side
+// failure only degrades search to the linear scan.
+int extend_graph_impl(void *arg)
+{
+  ExtendTask *task = static_cast<ExtendTask *>(arg);
+  CagraIndex *index = task->index_;
+  cuvsCagraExtendParams_t params = nullptr;
+  cuvsError_t err = cuvsCagraExtendParamsCreate(&params);
+  if (OB_FAIL(cuvs_errcode2ob(err, "create cagra extend params"))) {
+    LOG_WARN("hipvs extend params failed, keeping the host side scan", K(task->count_),
+             K(task->old_count_));
+    cuvsCagraIndexDestroy(index->cagra_);
+    index->cagra_ = nullptr;
+    index->built_ = false;
+  } else {
+    int64_t shape[2] = {0, 0};
+    DLManagedTensor rows_tensor;
+    fill_float_tensor(rows_tensor, const_cast<float *>(task->rows_), kDLCPU, task->count_,
+                      index->config_.dim, shape);
+    err = cuvsCagraExtend(index->resources_, params, &rows_tensor, index->cagra_);
+    if (OB_FAIL(cuvs_errcode2ob(err, "cagra extend"))) {
+      // The rows are already in the host buffers, rebuild so that the graph
+      // and the dataset never drift apart.
+      LOG_WARN("hipvs extend failed, rebuilding the graph", K(task->count_), K(task->old_count_));
+      const int build_ret = build_graph(index);
+      if (OB_SUCCESS != build_ret) {
+        // build_graph has already dropped the handle and cleared built_, the
+        // rows stay searchable through the host side scan instead of failing
+        // the append and risking a duplicate retry.
+        LOG_WARN("hipvs rebuild after a failed extend failed, keeping the host side scan",
+                 K(build_ret), K(index->count()));
+      }
+    } else {
+      LOG_INFO("hipvs extend finished", K(task->count_), K(index->count()), "cost_us",
+               elapsed_us(task->start_));
+    }
+    cuvsCagraExtendParamsDestroy(params);
+  }
+  return OB_SUCCESS;
+}
+
+int extend_graph(CagraIndex *index, int64_t old_count, int64_t count)
+{
+  ExtendTask task;
+  task.index_ = index;
+  task.rows_ = index->data_.data() + old_count * index->config_.dim;
+  task.count_ = count;
+  task.old_count_ = old_count;
+  task.start_ = std::chrono::steady_clock::now();
+  return run_on_gpu_thread(extend_graph_impl, &task);
 }
 
 #endif  // OB_USE_HIPVS
@@ -657,44 +793,9 @@ int extend(CagraIndex *index, const float *vectors, const int64_t *ids, int64_t 
       // optimize()/serialize() builds the graph once the snapshot is complete.
     } else {
 #ifdef OB_USE_HIPVS
-      const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-      cuvsCagraExtendParams_t params = nullptr;
-      cuvsError_t err = cuvsCagraExtendParamsCreate(&params);
-      if (OB_FAIL(cuvs_errcode2ob(err, "create cagra extend params"))) {
-        // The rows are already stored at this point, degrade to the host scan
-        // instead of failing an append that cannot be rolled back by the caller.
-        LOG_WARN("hipvs extend params failed, keeping the host side scan", K(ret),
-                 K(count), K(old_count));
-        cuvsCagraIndexDestroy(index->cagra_);
-        index->cagra_ = nullptr;
-        index->built_ = false;
-        ret = OB_SUCCESS;
-      } else {
-        int64_t shape[2] = {0, 0};
-        DLManagedTensor rows_tensor;
-        fill_float_tensor(rows_tensor,
-                          const_cast<float *>(index->data_.data()) + old_count * index->config_.dim,
-                          kDLCPU, count, index->config_.dim, shape);
-        err = cuvsCagraExtend(index->resources_, params, &rows_tensor, index->cagra_);
-        if (OB_FAIL(cuvs_errcode2ob(err, "cagra extend"))) {
-          // The rows are already in the host buffers, rebuild so that the graph
-          // and the dataset never drift apart.
-          LOG_WARN("hipvs extend failed, rebuilding the graph", K(ret), K(count), K(old_count));
-          const int build_ret = build_graph(index);
-          if (OB_SUCCESS != build_ret) {
-            // build_graph has already dropped the handle and cleared built_, the
-            // rows stay searchable through the host side scan instead of failing
-            // the append and risking a duplicate retry.
-            LOG_WARN("hipvs rebuild after a failed extend failed, keeping the host side scan",
-                     K(build_ret), K(index->count()));
-          }
-          ret = OB_SUCCESS;
-        } else {
-          LOG_INFO("hipvs extend finished", K(ret), K(count), K(index->count()),
-                   "cost_us", elapsed_us(start));
-        }
-        cuvsCagraExtendParamsDestroy(params);
-      }
+      // Never fails hard: the rows are stored either way, a failure only drops
+      // the graph and keeps the host side scan serving the index.
+      extend_graph(index, old_count, count);
 #else
       ret = OB_NOT_SUPPORTED;
 #endif
