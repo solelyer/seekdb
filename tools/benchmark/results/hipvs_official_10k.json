@@ -1,0 +1,346 @@
+{
+  "env": {
+    "host": "127.0.0.1",
+    "port": 2884,
+    "uname": "Linux 6.8.0-79-generic",
+    "cpu": "AMD EPYC 9334 32-Core Processor",
+    "cpu_quota": "1600000 100000",
+    "nproc": "128",
+    "memory": "503 GiB",
+    "gpu": "Card Series: \t\tAMD Radeon Graphics;GFX Version: \t\tgfx1100",
+    "vram": "47.9844 GiB",
+    "rocm": "7.2.4",
+    "hipvs": "1.0.0",
+    "server_version": "OceanBase 4.3.5.3 seekdb (r1.4.0.0) (Built 1-6cc4b91ae856856e4041c3144609f39bc5f2143d Oct 28 2026)"
+  },
+  "config": {
+    "host": "127.0.0.1",
+    "port": 2884,
+    "user": "root",
+    "password": "",
+    "database": "hipvs_bench",
+    "rows": 10000,
+    "dim": 128,
+    "queries": 100,
+    "topk": 10,
+    "batch": 500,
+    "metric": "l2",
+    "m": 16,
+    "ef_construction": 200,
+    "ef_search": 64,
+    "ef_search_list": [
+      64,
+      128,
+      256,
+      512
+    ],
+    "warmup": 10,
+    "rounds": 3,
+    "runs": 5,
+    "libs": [
+      "vsag",
+      "hipvs"
+    ],
+    "seed": 20261028,
+    "data_dir": "/seekdb_workspace/datasets",
+    "server_log": "/workspace/run/obs_exact/log/seekdb.log",
+    "gpu_sample_interval": 0.2,
+    "query_timeout": 3600,
+    "output": "final/official_10k.json",
+    "report": "final/official_10k.md"
+  },
+  "prep": {
+    "source": "/seekdb_workspace/datasets (truth gt_100x10.i32, agreement with numpy exact search 1.0000)",
+    "dataset_sec": 0.018558764830231667,
+    "base_load_sec": 0.50804827734828
+  },
+  "results": {
+    "vsag": {
+      "runs": [
+        {
+          "create_sec": 2.2015363182872534,
+          "first_query_sec": 0.011023301631212234,
+          "build_sec": 2.2125596199184656,
+          "log": {
+            "builds": [],
+            "fallbacks": []
+          }
+        },
+        {
+          "create_sec": 2.137594737112522,
+          "first_query_sec": 0.009112739935517311,
+          "build_sec": 2.1467074770480394,
+          "log": {
+            "builds": [],
+            "fallbacks": []
+          }
+        },
+        {
+          "create_sec": 2.1372703686356544,
+          "first_query_sec": 0.00816395878791809,
+          "build_sec": 2.1454343274235725,
+          "log": {
+            "builds": [],
+            "fallbacks": []
+          }
+        },
+        {
+          "create_sec": 2.1366229373961687,
+          "first_query_sec": 0.0072715431451797485,
+          "build_sec": 2.1438944805413485,
+          "log": {
+            "builds": [],
+            "fallbacks": []
+          }
+        },
+        {
+          "create_sec": 2.136641202494502,
+          "first_query_sec": 0.008524304255843163,
+          "build_sec": 2.1451655067503452,
+          "log": {
+            "builds": [],
+            "fallbacks": []
+          }
+        }
+      ],
+      "queries": [
+        {
+          "ef_search": 64,
+          "recall_at_k": 0.64,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.3021564334630966,
+          "p95_ms": 0.3179870545864105,
+          "mean_ms": 0.3039144103725751
+        },
+        {
+          "ef_search": 128,
+          "recall_at_k": 0.829,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.3572050482034683,
+          "p95_ms": 0.3723371773958206,
+          "mean_ms": 0.35843614488840103
+        },
+        {
+          "ef_search": 256,
+          "recall_at_k": 0.954,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.46877749264240265,
+          "p95_ms": 0.48404932022094727,
+          "mean_ms": 0.4697054127852122
+        },
+        {
+          "ef_search": 512,
+          "recall_at_k": 0.994,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.6618648767471313,
+          "p95_ms": 0.6781034171581268,
+          "mean_ms": 0.6659385375678539
+        }
+      ],
+      "copy_sec": 0.06041073799133301,
+      "error": null
+    },
+    "hipvs": {
+      "runs": [
+        {
+          "create_sec": 0.62625483982265,
+          "first_query_sec": 0.046056756749749184,
+          "build_sec": 0.6723115965723991,
+          "log": {
+            "builds": [
+              {
+                "index->count()": "10000",
+                "index->config_.dim": "128",
+                "algo": "exact_knn",
+                "knn_degree": "128",
+                "graph_degree": "64",
+                "knn_us": "329759",
+                "optimize_us": "17701",
+                "load_us": "713",
+                "host_threads": "16",
+                "cost_us": "349762",
+                "capability().device_name": "AMD Radeon Graphics",
+                "ts": "2026-10-28 18:38:30.872448"
+              }
+            ],
+            "fallbacks": []
+          },
+          "gpu_busy_max_pct": 8,
+          "vram_used_max_mb": 1079.76171875,
+          "gpu_samples": 3,
+          "rocm_smi_tail": ": 8\n==========================================================================================\n=================================== Current Memory Use ===================================\nGPU[0]\t\t: GPU Memory Allocated (VRAM%): 2\nGPU[0]\t\t: GPU Memory Read/Write Activity (%): 0\nGPU[0]\t\t: Memory Activity: N/A\nGPU[0]\t\t: Avg. Memory Bandwidth: 0\n==========================================================================================\n================================== Memory Usage (Bytes) ==================================\nGPU[0]\t\t: VRAM Total Memory (B): 51522830336\nGPU[0]\t\t: VRAM Total Used Memory (B): 1132212224\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+        },
+        {
+          "create_sec": 0.2052652146667242,
+          "first_query_sec": 0.013911416754126549,
+          "build_sec": 0.21917663142085075,
+          "log": {
+            "builds": [
+              {
+                "index->count()": "10000",
+                "index->config_.dim": "128",
+                "algo": "exact_knn",
+                "knn_degree": "128",
+                "graph_degree": "64",
+                "knn_us": "26665",
+                "optimize_us": "19596",
+                "load_us": "467",
+                "host_threads": "16",
+                "cost_us": "48794",
+                "capability().device_name": "AMD Radeon Graphics",
+                "ts": "2026-10-28 18:38:34.244453"
+              }
+            ],
+            "fallbacks": []
+          },
+          "gpu_busy_max_pct": 1,
+          "vram_used_max_mb": 1191.80078125,
+          "gpu_samples": 1,
+          "rocm_smi_tail": ": 1\n==========================================================================================\n=================================== Current Memory Use ===================================\nGPU[0]\t\t: GPU Memory Allocated (VRAM%): 2\nGPU[0]\t\t: GPU Memory Read/Write Activity (%): 7\nGPU[0]\t\t: Memory Activity: N/A\nGPU[0]\t\t: Avg. Memory Bandwidth: 0\n==========================================================================================\n================================== Memory Usage (Bytes) ==================================\nGPU[0]\t\t: VRAM Total Memory (B): 51522830336\nGPU[0]\t\t: VRAM Total Used Memory (B): 1249693696\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+        },
+        {
+          "create_sec": 0.23597104102373123,
+          "first_query_sec": 0.013441679999232292,
+          "build_sec": 0.24941272102296352,
+          "log": {
+            "builds": [
+              {
+                "index->count()": "10000",
+                "index->config_.dim": "128",
+                "algo": "exact_knn",
+                "knn_degree": "128",
+                "graph_degree": "64",
+                "knn_us": "25774",
+                "optimize_us": "18402",
+                "load_us": "426",
+                "host_threads": "16",
+                "cost_us": "45876",
+                "capability().device_name": "AMD Radeon Graphics",
+                "ts": "2026-10-28 18:38:37.473273"
+              }
+            ],
+            "fallbacks": []
+          },
+          "gpu_busy_max_pct": 99,
+          "vram_used_max_mb": 1113.83984375,
+          "gpu_samples": 1,
+          "rocm_smi_tail": " 99\n==========================================================================================\n=================================== Current Memory Use ===================================\nGPU[0]\t\t: GPU Memory Allocated (VRAM%): 2\nGPU[0]\t\t: GPU Memory Read/Write Activity (%): 0\nGPU[0]\t\t: Memory Activity: N/A\nGPU[0]\t\t: Avg. Memory Bandwidth: 0\n==========================================================================================\n================================== Memory Usage (Bytes) ==================================\nGPU[0]\t\t: VRAM Total Memory (B): 51522830336\nGPU[0]\t\t: VRAM Total Used Memory (B): 1167945728\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+        },
+        {
+          "create_sec": 0.20561956986784935,
+          "first_query_sec": 0.013488808646798134,
+          "build_sec": 0.21910837851464748,
+          "log": {
+            "builds": [
+              {
+                "index->count()": "10000",
+                "index->config_.dim": "128",
+                "algo": "exact_knn",
+                "knn_degree": "128",
+                "graph_degree": "64",
+                "knn_us": "20995",
+                "optimize_us": "17106",
+                "load_us": "422",
+                "host_threads": "16",
+                "cost_us": "39814",
+                "capability().device_name": "AMD Radeon Graphics",
+                "ts": "2026-10-28 18:38:40.646550"
+              }
+            ],
+            "fallbacks": []
+          },
+          "gpu_busy_max_pct": 99,
+          "vram_used_max_mb": 1189.90234375,
+          "gpu_samples": 1,
+          "rocm_smi_tail": " 99\n==========================================================================================\n=================================== Current Memory Use ===================================\nGPU[0]\t\t: GPU Memory Allocated (VRAM%): 2\nGPU[0]\t\t: GPU Memory Read/Write Activity (%): 6\nGPU[0]\t\t: Memory Activity: N/A\nGPU[0]\t\t: Avg. Memory Bandwidth: 0\n==========================================================================================\n================================== Memory Usage (Bytes) ==================================\nGPU[0]\t\t: VRAM Total Memory (B): 51522830336\nGPU[0]\t\t: VRAM Total Used Memory (B): 1247703040\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+        },
+        {
+          "create_sec": 0.20848423428833485,
+          "first_query_sec": 0.013036184012889862,
+          "build_sec": 0.2215204183012247,
+          "log": {
+            "builds": [
+              {
+                "index->count()": "10000",
+                "index->config_.dim": "128",
+                "algo": "exact_knn",
+                "knn_degree": "128",
+                "graph_degree": "64",
+                "knn_us": "20200",
+                "optimize_us": "16243",
+                "load_us": "409",
+                "host_threads": "16",
+                "cost_us": "38247",
+                "capability().device_name": "AMD Radeon Graphics",
+                "ts": "2026-10-28 18:38:43.624889"
+              }
+            ],
+            "fallbacks": []
+          },
+          "gpu_busy_max_pct": 99,
+          "vram_used_max_mb": 1177.921875,
+          "gpu_samples": 1,
+          "rocm_smi_tail": " 99\n==========================================================================================\n=================================== Current Memory Use ===================================\nGPU[0]\t\t: GPU Memory Allocated (VRAM%): 2\nGPU[0]\t\t: GPU Memory Read/Write Activity (%): 0\nGPU[0]\t\t: Memory Activity: N/A\nGPU[0]\t\t: Avg. Memory Bandwidth: 0\n==========================================================================================\n================================== Memory Usage (Bytes) ==================================\nGPU[0]\t\t: VRAM Total Memory (B): 51522830336\nGPU[0]\t\t: VRAM Total Used Memory (B): 1235140608\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+        }
+      ],
+      "queries": [
+        {
+          "ef_search": 64,
+          "recall_at_k": 0.991,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.836692750453949,
+          "p95_ms": 0.8642133325338364,
+          "mean_ms": 0.8715692286690077
+        },
+        {
+          "ef_search": 128,
+          "recall_at_k": 1.0,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 1.3256464153528214,
+          "p95_ms": 1.360580325126648,
+          "mean_ms": 1.3291423581540585
+        },
+        {
+          "ef_search": 256,
+          "recall_at_k": 1.0,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 3.3598411828279495,
+          "p95_ms": 3.50215844810009,
+          "mean_ms": 3.414941020309925
+        },
+        {
+          "ef_search": 512,
+          "recall_at_k": 1.0,
+          "invalid_results": 0,
+          "queries": 300,
+          "p50_ms": 0.6752833724021912,
+          "p95_ms": 0.6906930357217789,
+          "mean_ms": 0.6762107275426388
+        }
+      ],
+      "copy_sec": 0.059275319799780846,
+      "error": null
+    }
+  },
+  "summary": {
+    "vsag": {
+      "create_median_sec": 2.1372703686356544,
+      "build_median_sec": 2.1454343274235725,
+      "build_min_sec": 2.1438944805413485
+    },
+    "hipvs": {
+      "create_median_sec": 0.20848423428833485,
+      "build_median_sec": 0.2215204183012247,
+      "build_min_sec": 0.21910837851464748
+    },
+    "speedup_build": 9.68504097218794,
+    "speedup_create": 10.251472375986943
+  }
+}
