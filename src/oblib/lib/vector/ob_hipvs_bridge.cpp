@@ -375,10 +375,12 @@ int build_graph_impl(CagraIndex *index)
         std::max<int64_t>(hnsw_m * 4, 32), std::min<int64_t>(128, max_degree)));
     // ef_construction is the HNSW candidate list used while linking, the CAGRA
     // equivalent is the degree of the graph that gets pruned to graph_degree.
+    // Past 128 the pruned graph stops improving but the build keeps getting
+    // slower, so the contribution is capped there.
     const int64_t wanted_intermediate = std::max<int64_t>(
         static_cast<int64_t>(graph_degree) * 2,
         std::max<int64_t>(index->config_.intermediate_graph_degree,
-                          index->config_.ef_construction));
+                          std::min<int64_t>(index->config_.ef_construction, 128)));
     const size_t intermediate_degree = static_cast<size_t>(std::min<int64_t>(
         std::max<int64_t>(wanted_intermediate, static_cast<int64_t>(graph_degree)), max_degree));
     cuvsCagraIndexParams_t params = nullptr;
