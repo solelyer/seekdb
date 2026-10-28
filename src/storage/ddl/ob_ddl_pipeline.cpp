@@ -1023,7 +1023,24 @@ int ObHNSWIndexBuildOperator::serialize_vector_index(
         LOG_INFO("HgraphIndex finish vsag serialize for tablet", K(tablet_id_), K(ctx.ctx_.get_vals().count()), K(type));
       }
       if (OB_SUCC(ret)) {
-        if (OB_FAIL(adp->renew_single_snap_index((type == VIAT_HNSW_BQ || type == VIAT_IPIVF)
+        // The vector index scheduler may merge the partial snapshot adapter
+        // held above into a complete adapter while the snapshot is written.
+        // The complete adapter copies the snapshot key prefix and shares the
+        // snapshot memdata, so renewing through the stale partial adapter
+        // would empty the shared index while queries keep matching the copied
+        // prefix and skip loading the snapshot. Renew through the adapter
+        // that is registered now.
+        ObPluginVectorIndexAdapterGuard renew_guard;
+        ObPluginVectorIndexAdaptor *renew_adp = adp;
+        if (OB_SUCCESS == vec_index_service->acquire_adapter_guard(tablet_id_,
+                                                                   ObIndexType::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL,
+                                                                   renew_guard,
+                                                                   &ctx.vec_idx_param_,
+                                                                   ctx.vec_dim_)
+            && OB_NOT_NULL(renew_guard.get_adatper())) {
+          renew_adp = renew_guard.get_adatper();
+        }
+        if (OB_FAIL(renew_adp->renew_single_snap_index((type == VIAT_HNSW_BQ || type == VIAT_IPIVF)
             || (config::vector_index_memory_saving_mode() && (type == VIAT_HNSW || type == VIAT_HNSW_SQ || type == VIAT_HGRAPH))))) {
         }
       }
