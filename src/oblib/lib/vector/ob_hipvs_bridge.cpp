@@ -43,6 +43,7 @@
 #include <cuvs/distance/distance.h>
 #include <cuvs/neighbors/brute_force.h>
 #include <cuvs/neighbors/cagra.h>
+#include <cuvs/neighbors/ivf_flat.h>
 #include <dlpack/dlpack.h>
 #endif
 
@@ -70,6 +71,14 @@ constexpr int64_t MIN_GRAPH_ROWS = 1024;
 // grows with the square of the row count; measured on a W7900 at dim 128 it
 // stays ahead of IVF-PQ up to ~130k rows, with a better graph either way.
 constexpr double EXACT_KNN_MAX_WORK = 131072.0 * 131072.0 * 128.0;
+// Past that the kNN graph comes from an IVF-Flat search of the dataset against
+// itself: sqrt(rows) lists, IVF_KNN_PROBES of them probed per row. On the W7900
+// at 200k x 128 this takes 1.8s for a final recall@10 of 0.60, against 2.2s and
+// 0.43 for the IVF-PQ builder. The search result is held on the device in one
+// piece (rows * (knn_degree + 1) * 12 bytes), so very large inputs, and any
+// failure here, keep the IVF-PQ builder that works through host batches.
+constexpr int64_t IVF_KNN_PROBES = 32;
+constexpr int64_t IVF_KNN_MAX_ROWS = 4L * 1024 * 1024;
 // Host threads for the CAGRA graph optimization (detour pruning and reverse
 // edges) that follows the exact kNN search.
 constexpr int64_t MAX_OPTIMIZE_THREADS = 16;
@@ -452,6 +461,13 @@ void optimize_graph(const uint32_t *knn, int64_t rows, int64_t knn_degree,
       }
     }
     for (int64_t k = 0; k < knn_degree; ++k) {
+      // A padded short list repeats its last neighbour, keep only the first
+      // copy eligible so the duplicates are pruned first.
+      if (rank[neighbors[k]] != static_cast<uint16_t>(k + 1)) {
+        detour[k] = UINT32_MAX;
+      }
+    }
+    for (int64_t k = 0; k < knn_degree; ++k) {
       rank[neighbors[k]] = 0;
     }
     std::stable_sort(order, order + knn_degree,
@@ -497,9 +513,20 @@ void optimize_graph(const uint32_t *knn, int64_t rows, int64_t knn_degree,
   });
 }
 
-// Exact kNN of every row against the whole dataset on the GPU, self matches
+enum KnnAlgo {
+  KNN_EXACT = 0,
+  KNN_IVF_FLAT = 1,
+};
+
+const char *knn_algo_name(KnnAlgo algo)
+{
+  return algo == KNN_EXACT ? "exact_knn" : "ivf_flat_knn";
+}
+
+// kNN of every row against the whole dataset on the GPU, self matches
 // removed. knn is resized to rows x knn_degree.
-int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vector<uint32_t> &knn)
+int gpu_knn(CagraIndex *index, KnnAlgo algo, int64_t knn_degree, int64_t threads,
+            std::vector<uint32_t> &knn)
 {
   int ret = OB_SUCCESS;
   const int64_t rows = index->count();
@@ -509,6 +536,9 @@ int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vecto
   int64_t *neighbors = nullptr;
   float *distances = nullptr;
   cuvsBruteForceIndex_t brute_force = nullptr;
+  cuvsIvfFlatIndex_t ivf_flat = nullptr;
+  cuvsIvfFlatIndexParams_t ivf_build_params = nullptr;
+  cuvsIvfFlatSearchParams_t ivf_search_params = nullptr;
   if (cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&dataset), sizeof(float) * rows * dim)
       || cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&neighbors), sizeof(int64_t) * rows * width)
       || cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&distances), sizeof(float) * rows * width)) {
@@ -518,8 +548,6 @@ int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vecto
                                        cudaMemcpyHostToDevice)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("hipvs copy dataset to device failed", K(ret), K(rows));
-  } else if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceIndexCreate(&brute_force),
-                                     "create brute force index"))) {
   } else {
     int64_t dataset_shape[2] = {0, 0};
     int64_t neighbors_shape[2] = {0, 0};
@@ -535,22 +563,52 @@ int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vecto
     no_filter.addr = 0;
     no_filter.type = NO_FILTER;
     std::vector<int64_t> raw;
-    if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceBuild(index->resources_, &dataset_tensor,
-                                                    to_cuvs_metric(index->metric_code()), 0.0f,
-                                                    brute_force),
-                                "brute force build"))) {
-    } else if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceSearch(index->resources_, brute_force,
-                                                            &dataset_tensor, &neighbors_tensor,
-                                                            &distances_tensor, no_filter),
-                                       "brute force search"))) {
-    } else if (OB_FAIL(cuvs_errcode2ob(cuvsStreamSync(index->resources_), "brute force sync"))) {
+    if (algo == KNN_EXACT) {
+      if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceIndexCreate(&brute_force),
+                                  "create brute force index"))) {
+      } else if (OB_FAIL(cuvs_errcode2ob(
+                     cuvsBruteForceBuild(index->resources_, &dataset_tensor,
+                                         to_cuvs_metric(index->metric_code()), 0.0f, brute_force),
+                     "brute force build"))) {
+      } else if (OB_FAIL(cuvs_errcode2ob(
+                     cuvsBruteForceSearch(index->resources_, brute_force, &dataset_tensor,
+                                          &neighbors_tensor, &distances_tensor, no_filter),
+                     "brute force search"))) {
+      }
+    } else if (OB_FAIL(cuvs_errcode2ob(cuvsIvfFlatIndexParamsCreate(&ivf_build_params),
+                                       "create ivf flat params"))
+               || OB_FAIL(cuvs_errcode2ob(cuvsIvfFlatSearchParamsCreate(&ivf_search_params),
+                                          "create ivf flat search params"))
+               || OB_FAIL(cuvs_errcode2ob(cuvsIvfFlatIndexCreate(&ivf_flat),
+                                          "create ivf flat index"))) {
+    } else {
+      const int64_t lists = std::max<int64_t>(
+          IVF_KNN_PROBES, static_cast<int64_t>(std::sqrt(static_cast<double>(rows))));
+      ivf_build_params->metric = to_cuvs_metric(index->metric_code());
+      ivf_build_params->n_lists = static_cast<uint32_t>(lists);
+      ivf_build_params->kmeans_n_iters = 10;
+      ivf_build_params->kmeans_trainset_fraction = 0.1;
+      ivf_build_params->add_data_on_build = true;
+      ivf_search_params->n_probes = static_cast<uint32_t>(std::min(lists, IVF_KNN_PROBES));
+      if (OB_FAIL(cuvs_errcode2ob(cuvsIvfFlatBuild(index->resources_, ivf_build_params,
+                                                   &dataset_tensor, ivf_flat),
+                                  "ivf flat build"))) {
+      } else if (OB_FAIL(cuvs_errcode2ob(
+                     cuvsIvfFlatSearch(index->resources_, ivf_search_params, ivf_flat,
+                                       &dataset_tensor, &neighbors_tensor, &distances_tensor,
+                                       no_filter),
+                     "ivf flat search"))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(cuvs_errcode2ob(cuvsStreamSync(index->resources_), "gpu knn sync"))) {
     } else {
       raw.resize(rows * width);
       knn.resize(rows * knn_degree);
       if (cudaSuccess != cudaMemcpy(raw.data(), neighbors, sizeof(int64_t) * rows * width,
                                     cudaMemcpyDeviceToHost)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("hipvs copy exact knn to host failed", K(ret), K(rows));
+        LOG_WARN("hipvs copy knn graph to host failed", K(ret), K(rows));
       } else {
         std::atomic<int64_t> invalid(0);
         parallel_rows(rows, threads, [&](int64_t, int64_t row) {
@@ -558,25 +616,39 @@ int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vecto
           uint32_t *out = knn.data() + row * knn_degree;
           int64_t kept = 0;
           // The row itself is normally first, but an exact duplicate may
-          // take its place, so drop it wherever it shows up.
+          // take its place, so drop it wherever it shows up. IVF probes can
+          // come back short (invalid ids) for rows in tiny lists.
           for (int64_t k = 0; k < width && kept < knn_degree; ++k) {
             if (in[k] != row && in[k] >= 0 && in[k] < rows) {
               out[kept++] = static_cast<uint32_t>(in[k]);
             }
           }
-          if (kept < knn_degree) {
+          if (kept == 0) {
             invalid.fetch_add(1);
+          }
+          for (; kept < knn_degree && kept > 0; ++kept) {
+            // pad with the last neighbour, pruning sees it as a duplicate edge
+            out[kept] = out[kept - 1];
           }
         });
         if (invalid.load() > 0) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("hipvs exact knn returned short neighbour lists", K(ret), K(invalid.load()));
+          LOG_WARN("hipvs gpu knn returned rows without neighbours", K(ret), K(invalid.load()));
         }
       }
     }
   }
   if (brute_force != nullptr) {
     cuvsBruteForceIndexDestroy(brute_force);
+  }
+  if (ivf_flat != nullptr) {
+    cuvsIvfFlatIndexDestroy(ivf_flat);
+  }
+  if (ivf_search_params != nullptr) {
+    cuvsIvfFlatSearchParamsDestroy(ivf_search_params);
+  }
+  if (ivf_build_params != nullptr) {
+    cuvsIvfFlatIndexParamsDestroy(ivf_build_params);
   }
   if (distances != nullptr) {
     cudaFree(distances);
@@ -590,9 +662,9 @@ int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vecto
   return ret;
 }
 
-// Exact kNN graph on the GPU, CAGRA optimization on the host, then the graph
-// and the dataset are handed to cuVS as a ready CAGRA index.
-int build_exact_graph(CagraIndex *index, int64_t graph_degree, int64_t knn_degree)
+// kNN graph on the GPU, CAGRA optimization on the host, then the graph and the
+// dataset are handed to cuVS as a ready CAGRA index.
+int build_knn_graph(CagraIndex *index, KnnAlgo algo, int64_t graph_degree, int64_t knn_degree)
 {
   int ret = OB_SUCCESS;
   const int64_t rows = index->count();
@@ -601,7 +673,7 @@ int build_exact_graph(CagraIndex *index, int64_t graph_degree, int64_t knn_degre
   try {
     std::vector<uint32_t> knn;
     std::vector<uint32_t> graph;
-    if (OB_FAIL(exact_knn(index, knn_degree, threads, knn))) {
+    if (OB_FAIL(gpu_knn(index, algo, knn_degree, threads, knn))) {
     } else {
       const std::chrono::steady_clock::time_point knn_done = std::chrono::steady_clock::now();
       graph.resize(rows * graph_degree);
@@ -619,11 +691,11 @@ int build_exact_graph(CagraIndex *index, int64_t graph_degree, int64_t knn_degre
       } else if (OB_FAIL(cuvs_errcode2ob(
                      cuvsCagraIndexFromArgs(index->resources_, to_cuvs_metric(index->metric_code()),
                                             &graph_tensor, &dataset_tensor, index->cagra_),
-                     "cagra index from exact graph"))) {
+                     "cagra index from knn graph"))) {
       } else if (OB_FAIL(cuvs_errcode2ob(cuvsStreamSync(index->resources_), "cagra load sync"))) {
       } else {
         CagraIndex::BuildStats &stats = index->build_stats_;
-        stats.algo_ = "exact_knn";
+        stats.algo_ = knn_algo_name(algo);
         stats.knn_degree_ = knn_degree;
         stats.graph_degree_ = graph_degree;
         stats.knn_us_ = std::chrono::duration_cast<std::chrono::microseconds>(knn_done - start).count();
@@ -635,7 +707,7 @@ int build_exact_graph(CagraIndex *index, int64_t graph_degree, int64_t knn_degre
     }
   } catch (const std::exception &e) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("hipvs exact graph build ran out of memory", K(ret), K(rows), KCSTRING(e.what()));
+    LOG_WARN("hipvs knn graph build ran out of memory", K(ret), K(rows), KCSTRING(e.what()));
   }
   if (OB_FAIL(ret) && index->cagra_ != nullptr) {
     cuvsCagraIndexDestroy(index->cagra_);
@@ -700,17 +772,19 @@ int build_graph_impl(CagraIndex *index)
       index->build_stats_ = CagraIndex::BuildStats();
       const double work = static_cast<double>(total) * static_cast<double>(total)
                           * static_cast<double>(index->config_.dim);
-      bool exact_built = false;
-      if (work <= EXACT_KNN_MAX_WORK) {
-        if (OB_FAIL(build_exact_graph(index, static_cast<int64_t>(graph_degree),
-                                      static_cast<int64_t>(params->intermediate_graph_degree)))) {
-          LOG_WARN("hipvs exact knn graph build failed, retrying with IVF-PQ", K(ret), K(total));
+      bool knn_built = false;
+      if (work <= EXACT_KNN_MAX_WORK || total <= IVF_KNN_MAX_ROWS) {
+        const KnnAlgo algo = work <= EXACT_KNN_MAX_WORK ? KNN_EXACT : KNN_IVF_FLAT;
+        if (OB_FAIL(build_knn_graph(index, algo, static_cast<int64_t>(graph_degree),
+                                    static_cast<int64_t>(params->intermediate_graph_degree)))) {
+          LOG_WARN("hipvs knn graph build failed, retrying with IVF-PQ", K(ret), K(total),
+                   KCSTRING(knn_algo_name(algo)));
           ret = OB_SUCCESS;
         } else {
-          exact_built = true;
+          knn_built = true;
         }
       }
-      if (exact_built) {
+      if (knn_built) {
         index->built_ = true;
       } else if (OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_),
                                          "create cagra index"))) {
