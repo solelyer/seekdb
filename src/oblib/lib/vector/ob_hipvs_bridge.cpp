@@ -68,11 +68,11 @@ constexpr int64_t MIN_GRAPH_ROWS = 1024;
 // computed exactly by a GPU brute force search. On gfx1100 the IVF-PQ graph
 // builder is bound by thousands of tiny kernel launches (PQ codebook kmeans),
 // 0.8s for 10k rows, while the exact search takes 12ms there. The exact search
-// grows with the square of the row count; measured on a W7900 at dim 128 it
+// grows with the square of the row count; measured on gfx1100 at dim 128 it
 // stays ahead of IVF-PQ up to ~130k rows, with a better graph either way.
 constexpr double EXACT_KNN_MAX_WORK = 131072.0 * 131072.0 * 128.0;
 // Past that the kNN graph comes from an IVF-Flat search of the dataset against
-// itself: sqrt(rows) lists, IVF_KNN_PROBES of them probed per row. On the W7900
+// itself: sqrt(rows) lists, IVF_KNN_PROBES of them probed per row. On gfx1100
 // at 200k x 128 this takes 1.8s for a final recall@10 of 0.60, against 2.2s and
 // 0.43 for the IVF-PQ builder. The search result is held on the device in one
 // piece (rows * (knn_degree + 1) * 12 bytes), so very large inputs, and any
