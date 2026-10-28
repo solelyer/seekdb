@@ -21,6 +21,7 @@ Required server side: seekdb built with -DOB_USE_HIPVS=ON for LIB=HIPVS.
 """
 
 import argparse
+import glob
 import itertools
 import json
 import os
@@ -312,6 +313,7 @@ def collect_env(conn, args):
         "ef_search": args.ef_search,
         "runs": args.runs,
         "rounds": args.rounds,
+        "data_dir": args.data_dir or "generated (seed %d)" % args.seed,
         "uname": os.uname().sysname + " " + os.uname().release,
     }
     try:
@@ -337,7 +339,7 @@ def write_report(path, env, results):
     lines.append("")
     lines.append("## Configuration\n")
     for key in ("rows", "dim", "queries", "topk", "metric", "m",
-                "ef_construction", "ef_search", "runs", "rounds"):
+                "ef_construction", "ef_search", "runs", "rounds", "data_dir"):
         lines.append("- %s: `%s`" % (key, env.get(key)))
     lines.append("")
     lines.append("## Build (CREATE VECTOR INDEX over %d rows)\n" % env["rows"])
@@ -400,20 +402,45 @@ def parse_args():
     parser.add_argument("--runs", type=int, default=3, help="index build repetitions")
     parser.add_argument("--libs", default="none,vsag,hipvs")
     parser.add_argument("--seed", type=int, default=20261028)
+    parser.add_argument("--data-dir", default="",
+                        help="directory with base.f32, query.f32 and gt_*.i32 "
+                             "(the competition dataset layout), overrides --rows/--queries/--topk")
     parser.add_argument("--query-timeout", type=int, default=3600)
     parser.add_argument("--output", default="hipvs_bench.json")
     parser.add_argument("--report", default="hipvs_report.md")
     return parser.parse_args()
 
 
+def load_dataset(args):
+    """Returns (vectors, queries, truth) either from --data-dir or generated."""
+    if not args.data_dir:
+        vectors, queries = make_data(args)
+        log("computing ground truth")
+        return vectors, queries, ground_truth(vectors, queries, args.topk, args.metric)
+    vectors = np.fromfile(os.path.join(args.data_dir, "base.f32"),
+                          dtype=np.float32).reshape(-1, args.dim)
+    queries = np.fromfile(os.path.join(args.data_dir, "query.f32"),
+                          dtype=np.float32).reshape(-1, args.dim)
+    gt_files = sorted(glob.glob(os.path.join(args.data_dir, "gt_*.i32")))
+    if not gt_files:
+        raise SystemExit("no gt_*.i32 ground truth under %s" % args.data_dir)
+    gt = np.fromfile(gt_files[0], dtype=np.int32)
+    args.rows = int(vectors.shape[0])
+    args.queries = int(queries.shape[0])
+    args.topk = int(gt.size // args.queries)
+    truth = [set(int(i) for i in row)
+             for row in gt.reshape(args.queries, args.topk)]
+    log("loaded dataset %s: rows=%d dim=%d queries=%d topk=%d"
+        % (args.data_dir, args.rows, args.dim, args.queries, args.topk))
+    return vectors, queries, truth
+
+
 def main():
     args = parse_args()
     libs = [v.strip().lower() for v in args.libs.split(",") if v.strip()]
-    log("benchmark config: rows=%d dim=%d libs=%s" % (args.rows, args.dim, libs))
 
-    vectors, queries = make_data(args)
-    log("computing ground truth")
-    truth = ground_truth(vectors, queries, args.topk, args.metric)
+    vectors, queries, truth = load_dataset(args)
+    log("benchmark config: rows=%d dim=%d libs=%s" % (args.rows, args.dim, libs))
 
     conn = connect(args)
     try:
