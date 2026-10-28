@@ -146,7 +146,7 @@ done
 | 内存 | 503 GiB |
 | GPU | AMD Radeon（gfx1100 / RDNA3，48 GiB 显存，rocm-smi Card Model 0x744b），单卡 |
 | ROCm / hipVS | ROCm 7.2.4 / hipVS（cuVS）1.0.0，`/opt/hipvs` |
-| seekdb | 1.4.0.0，`contest/hipvs-exact-knn` 分支提交 `37fdb9148`，RelWithDebInfo，`-DOB_USE_HIPVS=ON` |
+| seekdb | 1.4.0.0，`contest/hipvs-exact-knn` 分支，第 5~7 节数据用提交 `6d64161e5` 的构建（RelWithDebInfo，`-DOB_USE_HIPVS=ON`）；之后的 `2228991fd` 只收紧了 2.5 节快照重置的条件，复测 10k 为 VSAG 2.132 s / HIPVS 0.218 s（9.76x），200k 首查 20 / 20 正常 |
 | observer 参数 | `memory_budget=16G, cpu_count=64`，单机单副本 |
 
 ## 5. 构建耗时原始数据
