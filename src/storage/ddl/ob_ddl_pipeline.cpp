@@ -1030,6 +1030,9 @@ int ObHNSWIndexBuildOperator::serialize_vector_index(
         // would empty the shared index while queries keep matching the copied
         // prefix and skip loading the snapshot. Renew through the adapter
         // that is registered now.
+        // Anything else registered under the tablet (the same partial
+        // adapter, or a fresh one after a concurrent drop) keeps the old
+        // behaviour.
         ObPluginVectorIndexAdapterGuard renew_guard;
         ObPluginVectorIndexAdaptor *renew_adp = adp;
         if (OB_SUCCESS == vec_index_service->acquire_adapter_guard(tablet_id_,
@@ -1037,7 +1040,9 @@ int ObHNSWIndexBuildOperator::serialize_vector_index(
                                                                    renew_guard,
                                                                    &ctx.vec_idx_param_,
                                                                    ctx.vec_dim_)
-            && OB_NOT_NULL(renew_guard.get_adatper())) {
+            && OB_NOT_NULL(renew_guard.get_adatper())
+            && renew_guard.get_adatper() != adp
+            && renew_guard.get_adatper()->is_complete()) {
           renew_adp = renew_guard.get_adatper();
         }
         if (OB_FAIL(renew_adp->renew_single_snap_index((type == VIAT_HNSW_BQ || type == VIAT_IPIVF)
