@@ -381,7 +381,10 @@ void ObIndependentDag::wait_signal()
   int tmp_ret = OB_SUCCESS;
   ObThreadCondGuard guard(cond_);
   const int64_t begin_wait_time = ObTimeUtility::fast_current_time();
-  if (OB_TMP_FAIL(cond_.wait(DAG_COND_TIMEOUT_MS))) {
+  // The final status is set before the finishing thread broadcasts under
+  // cond_, checking it here closes the window where that wake-up is missed.
+  if (is_final_status()) {
+  } else if (OB_TMP_FAIL(cond_.wait(DAG_COND_TIMEOUT_MS))) {
     if (OB_TIMEOUT != tmp_ret) {
       COMMON_LOG(WARN, "failed to wait cond", K(tmp_ret));
     }
@@ -465,6 +468,14 @@ int ObIndependentDag::deal_with_finish_task(
       ObIDag::ObDagStatus status = is_dag_failed() ? ObIDag::DAG_STATUS_ABORT : ObIDag::DAG_STATUS_FINISH;
       set_dag_status(status);
       COMMON_LOG(INFO, "dag finished", K(ret), K_(dag_ret), K(status), "runtime", ObTimeUtility::fast_current_time() - start_time_, KPC(this));
+      // Idle threads sleep in wait_signal() until a task becomes ready or the
+      // cond times out; wake them now so they see the final status at once
+      // instead of holding up the dag thread pool join by up to
+      // DAG_COND_TIMEOUT_MS.
+      ObThreadCondGuard cond_guard(cond_);
+      if (OB_TMP_FAIL(cond_.broadcast())) {
+        COMMON_LOG(WARN, "failed to wake up dag threads", K(tmp_ret));
+      }
     }
   }
   COMMON_LOG(INFO, "finish deal with finish task", K(ret), K(error_code), K(task_is_suspended));
