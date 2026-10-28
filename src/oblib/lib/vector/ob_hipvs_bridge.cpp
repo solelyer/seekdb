@@ -19,12 +19,14 @@
 #include "ob_hipvs_bridge.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +41,7 @@
 
 #include <cuvs/core/c_api.h>
 #include <cuvs/distance/distance.h>
+#include <cuvs/neighbors/brute_force.h>
 #include <cuvs/neighbors/cagra.h>
 #include <dlpack/dlpack.h>
 #endif
@@ -58,6 +61,16 @@ constexpr int64_t MAX_SEARCH_CANDIDATES = 65536;
 // Below this many rows the host side linear scan is cheaper than a GPU build
 // and IVF-PQ, the CAGRA graph builder, is not meant for toy datasets.
 constexpr int64_t MIN_GRAPH_ROWS = 1024;
+// Up to this much work (rows * rows * dim) the kNN graph that CAGRA prunes is
+// computed exactly by a GPU brute force search. On gfx1100 the IVF-PQ graph
+// builder is bound by thousands of tiny kernel launches (PQ codebook kmeans),
+// 0.8s for 10k rows, while the exact search takes 12ms there. The exact search
+// grows with the square of the row count; measured on a W7900 at dim 128 it
+// stays ahead of IVF-PQ up to ~130k rows, with a better graph either way.
+constexpr double EXACT_KNN_MAX_WORK = 131072.0 * 131072.0 * 128.0;
+// Host threads for the CAGRA graph optimization (detour pruning and reverse
+// edges) that follows the exact kNN search.
+constexpr int64_t MAX_OPTIMIZE_THREADS = 16;
 
 enum MetricCode : int32_t {
   METRIC_L2 = 0,
@@ -145,6 +158,17 @@ public:
   std::vector<char> extras_;
   std::unordered_map<int64_t, int64_t> vid2row_;
   bool built_ = false;
+  // How the last graph was built, logged by the caller once the GPU thread
+  // has returned.
+  struct BuildStats {
+    const char *algo_ = "none";
+    int64_t knn_degree_ = 0;
+    int64_t graph_degree_ = 0;
+    int64_t knn_us_ = 0;
+    int64_t optimize_us_ = 0;
+    int64_t load_us_ = 0;
+    int64_t threads_ = 0;
+  } build_stats_;
   int64_t min_vid_ = INT64_MAX;
   int64_t max_vid_ = INT64_MIN;
   // Readers (search, distance lookups, serialization) share the lock, writers
@@ -353,6 +377,271 @@ int run_on_gpu_thread(int (*fn)(void *), void *arg)
   return ret;
 }
 
+int64_t optimize_threads(int64_t rows)
+{
+  const int64_t hw = static_cast<int64_t>(std::thread::hardware_concurrency());
+  const int64_t threads = std::min<int64_t>(MAX_OPTIMIZE_THREADS, hw > 0 ? hw : 1);
+  // Pruning costs about 1us per row and thread start-up a few tens of
+  // microseconds, so a few hundred rows per thread already pays off.
+  return std::max<int64_t>(1, std::min<int64_t>(threads, rows / 512));
+}
+
+// Runs fn(thread_idx, row) for every row. The calling thread takes part, so a
+// failed thread start only costs parallelism.
+template <typename Fn>
+void parallel_rows(int64_t rows, int64_t threads, Fn &&fn)
+{
+  constexpr int64_t CHUNK = 64;
+  std::atomic<int64_t> next(0);
+  auto worker = [&](int64_t thread_idx) {
+    for (int64_t begin = next.fetch_add(CHUNK); begin < rows; begin = next.fetch_add(CHUNK)) {
+      const int64_t end = std::min(rows, begin + CHUNK);
+      for (int64_t row = begin; row < end; ++row) {
+        fn(thread_idx, row);
+      }
+    }
+  };
+  std::vector<std::thread> pool;
+  try {
+    pool.reserve(threads);
+    for (int64_t i = 1; i < threads; ++i) {
+      pool.emplace_back(worker, i);
+    }
+  } catch (const std::exception &) {
+    // run with the threads that did start
+  }
+  worker(0);
+  for (int64_t i = 0; i < static_cast<int64_t>(pool.size()); ++i) {
+    pool.at(i).join();
+  }
+}
+
+// Turns an exact kNN graph (rows x knn_degree, best first, no self loops) into
+// a CAGRA search graph following cuVS cagra::optimize: rank based detour
+// pruning keeps the graph_degree edges least reachable through a closer
+// neighbour, then reverse edges take over the second half of every list so
+// that hubs stay reachable. Throws std::bad_alloc.
+void optimize_graph(const uint32_t *knn, int64_t rows, int64_t knn_degree,
+                    int64_t graph_degree, int64_t threads, uint32_t *graph)
+{
+  // Per thread scratch: rank + 1 of every node in the current row, 0 = absent.
+  std::vector<std::vector<uint16_t>> ranks(threads, std::vector<uint16_t>(rows, 0));
+  std::vector<std::vector<uint32_t>> detours(threads, std::vector<uint32_t>(knn_degree));
+  std::vector<std::vector<int32_t>> orders(threads, std::vector<int32_t>(knn_degree));
+  parallel_rows(rows, threads, [&](int64_t thread_idx, int64_t row) {
+    uint16_t *rank = ranks.at(thread_idx).data();
+    uint32_t *detour = detours.at(thread_idx).data();
+    int32_t *order = orders.at(thread_idx).data();
+    const uint32_t *neighbors = knn + row * knn_degree;
+    for (int64_t k = knn_degree - 1; k >= 0; --k) {
+      rank[neighbors[k]] = static_cast<uint16_t>(k + 1);
+      detour[k] = 0;
+      order[k] = static_cast<int32_t>(k);
+    }
+    // A -> B is detourable through D when D ranks before B for A and B is
+    // one of D's own neighbours.
+    for (int64_t kad = 0; kad + 1 < knn_degree; ++kad) {
+      const uint32_t *via = knn + static_cast<int64_t>(neighbors[kad]) * knn_degree;
+      for (int64_t kdb = 0; kdb < knn_degree; ++kdb) {
+        const int64_t kab = static_cast<int64_t>(rank[via[kdb]]) - 1;
+        if (kab > kad) {
+          ++detour[kab];
+        }
+      }
+    }
+    for (int64_t k = 0; k < knn_degree; ++k) {
+      rank[neighbors[k]] = 0;
+    }
+    std::stable_sort(order, order + knn_degree,
+                     [detour](int32_t lhs, int32_t rhs) { return detour[lhs] < detour[rhs]; });
+    uint32_t *out = graph + row * graph_degree;
+    for (int64_t k = 0; k < graph_degree; ++k) {
+      out[k] = neighbors[order[k]];
+    }
+  });
+  // Reverse edges, rank by rank so that close neighbours win the slots.
+  std::vector<uint32_t> reverse(rows * graph_degree);
+  std::vector<uint32_t> reverse_count(rows, 0);
+  for (int64_t k = 0; k < graph_degree; ++k) {
+    for (int64_t row = 0; row < rows; ++row) {
+      const uint32_t target = graph[row * graph_degree + k];
+      uint32_t &count = reverse_count[target];
+      if (count < static_cast<uint32_t>(graph_degree)) {
+        reverse[static_cast<int64_t>(target) * graph_degree + count] = static_cast<uint32_t>(row);
+        ++count;
+      }
+    }
+  }
+  const int64_t protected_edges = graph_degree / 2;
+  parallel_rows(rows, threads, [&](int64_t, int64_t row) {
+    uint32_t *out = graph + row * graph_degree;
+    const uint32_t *incoming = reverse.data() + row * graph_degree;
+    for (int64_t r = static_cast<int64_t>(reverse_count[row]) - 1; r >= 0; --r) {
+      const uint32_t source = incoming[r];
+      int64_t pos = graph_degree;
+      for (int64_t k = 0; k < graph_degree; ++k) {
+        if (out[k] == source) {
+          pos = k;
+          break;
+        }
+      }
+      if (pos >= protected_edges) {
+        const int64_t shift = pos == graph_degree ? graph_degree - protected_edges - 1
+                                                  : pos - protected_edges;
+        memmove(out + protected_edges + 1, out + protected_edges, sizeof(uint32_t) * shift);
+        out[protected_edges] = source;
+      }
+    }
+  });
+}
+
+// Exact kNN of every row against the whole dataset on the GPU, self matches
+// removed. knn is resized to rows x knn_degree.
+int exact_knn(CagraIndex *index, int64_t knn_degree, int64_t threads, std::vector<uint32_t> &knn)
+{
+  int ret = OB_SUCCESS;
+  const int64_t rows = index->count();
+  const int64_t dim = index->config_.dim;
+  const int64_t width = knn_degree + 1;
+  float *dataset = nullptr;
+  int64_t *neighbors = nullptr;
+  float *distances = nullptr;
+  cuvsBruteForceIndex_t brute_force = nullptr;
+  if (cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&dataset), sizeof(float) * rows * dim)
+      || cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&neighbors), sizeof(int64_t) * rows * width)
+      || cudaSuccess != cudaMalloc(reinterpret_cast<void **>(&distances), sizeof(float) * rows * width)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("hipvs allocate exact knn buffers failed", K(ret), K(rows), K(width));
+  } else if (cudaSuccess != cudaMemcpy(dataset, index->data_.data(), sizeof(float) * rows * dim,
+                                       cudaMemcpyHostToDevice)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hipvs copy dataset to device failed", K(ret), K(rows));
+  } else if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceIndexCreate(&brute_force),
+                                     "create brute force index"))) {
+  } else {
+    int64_t dataset_shape[2] = {0, 0};
+    int64_t neighbors_shape[2] = {0, 0};
+    int64_t distances_shape[2] = {0, 0};
+    DLManagedTensor dataset_tensor;
+    DLManagedTensor neighbors_tensor;
+    DLManagedTensor distances_tensor;
+    fill_float_tensor(dataset_tensor, dataset, kDLCUDA, rows, dim, dataset_shape);
+    init_managed_tensor(neighbors_tensor, neighbors, kDLCUDA, DLDataType{kDLInt, 64, 1}, rows,
+                        width, neighbors_shape);
+    fill_float_tensor(distances_tensor, distances, kDLCUDA, rows, width, distances_shape);
+    cuvsFilter no_filter;
+    no_filter.addr = 0;
+    no_filter.type = NO_FILTER;
+    std::vector<int64_t> raw;
+    if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceBuild(index->resources_, &dataset_tensor,
+                                                    to_cuvs_metric(index->metric_code()), 0.0f,
+                                                    brute_force),
+                                "brute force build"))) {
+    } else if (OB_FAIL(cuvs_errcode2ob(cuvsBruteForceSearch(index->resources_, brute_force,
+                                                            &dataset_tensor, &neighbors_tensor,
+                                                            &distances_tensor, no_filter),
+                                       "brute force search"))) {
+    } else if (OB_FAIL(cuvs_errcode2ob(cuvsStreamSync(index->resources_), "brute force sync"))) {
+    } else {
+      raw.resize(rows * width);
+      knn.resize(rows * knn_degree);
+      if (cudaSuccess != cudaMemcpy(raw.data(), neighbors, sizeof(int64_t) * rows * width,
+                                    cudaMemcpyDeviceToHost)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hipvs copy exact knn to host failed", K(ret), K(rows));
+      } else {
+        std::atomic<int64_t> invalid(0);
+        parallel_rows(rows, threads, [&](int64_t, int64_t row) {
+          const int64_t *in = raw.data() + row * width;
+          uint32_t *out = knn.data() + row * knn_degree;
+          int64_t kept = 0;
+          // The row itself is normally first, but an exact duplicate may
+          // take its place, so drop it wherever it shows up.
+          for (int64_t k = 0; k < width && kept < knn_degree; ++k) {
+            if (in[k] != row && in[k] >= 0 && in[k] < rows) {
+              out[kept++] = static_cast<uint32_t>(in[k]);
+            }
+          }
+          if (kept < knn_degree) {
+            invalid.fetch_add(1);
+          }
+        });
+        if (invalid.load() > 0) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("hipvs exact knn returned short neighbour lists", K(ret), K(invalid.load()));
+        }
+      }
+    }
+  }
+  if (brute_force != nullptr) {
+    cuvsBruteForceIndexDestroy(brute_force);
+  }
+  if (distances != nullptr) {
+    cudaFree(distances);
+  }
+  if (neighbors != nullptr) {
+    cudaFree(neighbors);
+  }
+  if (dataset != nullptr) {
+    cudaFree(dataset);
+  }
+  return ret;
+}
+
+// Exact kNN graph on the GPU, CAGRA optimization on the host, then the graph
+// and the dataset are handed to cuVS as a ready CAGRA index.
+int build_exact_graph(CagraIndex *index, int64_t graph_degree, int64_t knn_degree)
+{
+  int ret = OB_SUCCESS;
+  const int64_t rows = index->count();
+  const int64_t threads = optimize_threads(rows);
+  const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  try {
+    std::vector<uint32_t> knn;
+    std::vector<uint32_t> graph;
+    if (OB_FAIL(exact_knn(index, knn_degree, threads, knn))) {
+    } else {
+      const std::chrono::steady_clock::time_point knn_done = std::chrono::steady_clock::now();
+      graph.resize(rows * graph_degree);
+      optimize_graph(knn.data(), rows, knn_degree, graph_degree, threads, graph.data());
+      std::vector<uint32_t>().swap(knn);
+      const std::chrono::steady_clock::time_point optimize_done = std::chrono::steady_clock::now();
+      int64_t dataset_shape[2] = {0, 0};
+      int64_t graph_shape[2] = {0, 0};
+      DLManagedTensor dataset_tensor;
+      DLManagedTensor graph_tensor;
+      fill_float_tensor(dataset_tensor, index->data_.data(), kDLCPU, rows, index->config_.dim,
+                        dataset_shape);
+      fill_u32_tensor(graph_tensor, graph.data(), kDLCPU, rows, graph_degree, graph_shape);
+      if (OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_), "create cagra index"))) {
+      } else if (OB_FAIL(cuvs_errcode2ob(
+                     cuvsCagraIndexFromArgs(index->resources_, to_cuvs_metric(index->metric_code()),
+                                            &graph_tensor, &dataset_tensor, index->cagra_),
+                     "cagra index from exact graph"))) {
+      } else if (OB_FAIL(cuvs_errcode2ob(cuvsStreamSync(index->resources_), "cagra load sync"))) {
+      } else {
+        CagraIndex::BuildStats &stats = index->build_stats_;
+        stats.algo_ = "exact_knn";
+        stats.knn_degree_ = knn_degree;
+        stats.graph_degree_ = graph_degree;
+        stats.knn_us_ = std::chrono::duration_cast<std::chrono::microseconds>(knn_done - start).count();
+        stats.optimize_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 optimize_done - knn_done).count();
+        stats.load_us_ = elapsed_us(optimize_done);
+        stats.threads_ = threads;
+      }
+    }
+  } catch (const std::exception &e) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("hipvs exact graph build ran out of memory", K(ret), K(rows), KCSTRING(e.what()));
+  }
+  if (OB_FAIL(ret) && index->cagra_ != nullptr) {
+    cuvsCagraIndexDestroy(index->cagra_);
+    index->cagra_ = nullptr;
+  }
+  return ret;
+}
+
 int build_graph_impl(CagraIndex *index)
 {
   int ret = OB_SUCCESS;
@@ -397,8 +686,8 @@ int build_graph_impl(CagraIndex *index)
       DLManagedTensor dataset_tensor;
       fill_float_tensor(dataset_tensor, const_cast<float *>(index->data_.data()), kDLCPU, total,
                         index->config_.dim, shape);
-      // cuvsCagraBuild allocates a new index and stores it in the handle, the
-      // previous one (if any) would leak unless it is destroyed here.
+      // A new index is stored in the handle below, the previous one (if any)
+      // would leak unless it is destroyed here.
       if (index->cagra_ != nullptr) {
         cuvsCagraIndexDestroy(index->cagra_);
         index->cagra_ = nullptr;
@@ -406,14 +695,37 @@ int build_graph_impl(CagraIndex *index)
       // Between the destroy above and a successful build there is no usable
       // graph, search must not look at the handle until built_ flips back.
       index->built_ = false;
-      if (OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_), "create cagra index"))) {
-      } else if (OB_FAIL(cuvs_errcode2ob(
-                     cuvsCagraBuild(index->resources_, params, &dataset_tensor, index->cagra_),
-                     "cagra build"))) {
-        cuvsCagraIndexDestroy(index->cagra_);
-        index->cagra_ = nullptr;
-      } else {
+      index->build_stats_ = CagraIndex::BuildStats();
+      const double work = static_cast<double>(total) * static_cast<double>(total)
+                          * static_cast<double>(index->config_.dim);
+      bool exact_built = false;
+      if (work <= EXACT_KNN_MAX_WORK) {
+        if (OB_FAIL(build_exact_graph(index, static_cast<int64_t>(graph_degree),
+                                      static_cast<int64_t>(params->intermediate_graph_degree)))) {
+          LOG_WARN("hipvs exact knn graph build failed, retrying with IVF-PQ", K(ret), K(total));
+          ret = OB_SUCCESS;
+        } else {
+          exact_built = true;
+        }
+      }
+      if (exact_built) {
         index->built_ = true;
+      } else if (OB_FAIL(cuvs_errcode2ob(cuvsCagraIndexCreate(&index->cagra_),
+                                         "create cagra index"))) {
+      } else {
+        const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        if (OB_FAIL(cuvs_errcode2ob(
+                cuvsCagraBuild(index->resources_, params, &dataset_tensor, index->cagra_),
+                "cagra build"))) {
+          cuvsCagraIndexDestroy(index->cagra_);
+          index->cagra_ = nullptr;
+        } else {
+          index->built_ = true;
+          index->build_stats_.algo_ = "ivf_pq";
+          index->build_stats_.knn_degree_ = static_cast<int64_t>(params->intermediate_graph_degree);
+          index->build_stats_.graph_degree_ = static_cast<int64_t>(graph_degree);
+          index->build_stats_.knn_us_ = elapsed_us(start);
+        }
       }
       cuvsCagraIndexParamsDestroy(params);
     }
@@ -749,6 +1061,10 @@ int build(CagraIndex *index, const float *vectors, const int64_t *ids, int64_t c
       } else {
         LOG_INFO("hipvs build finished", K(ret), K(count), K(index->config_.dim),
                  KCSTRING(metric_name(index->metric_code())), K(index->config_.graph_degree),
+                 "algo", ::oceanbase::common::ObSzString(index->build_stats_.algo_), "knn_degree", index->build_stats_.knn_degree_,
+                 "graph_degree", index->build_stats_.graph_degree_, "knn_us", index->build_stats_.knn_us_,
+                 "optimize_us", index->build_stats_.optimize_us_, "load_us", index->build_stats_.load_us_,
+                 "host_threads", index->build_stats_.threads_,
                  "cost_us", elapsed_us(start), KCSTRING(capability().device_name));
       }
 #else
@@ -783,6 +1099,10 @@ int optimize(CagraIndex *index)
       } else {
         LOG_INFO("hipvs graph built", K(ret), K(index->count()), K(index->config_.dim),
                  KCSTRING(metric_name(index->metric_code())), K(index->config_.graph_degree),
+                 "algo", ::oceanbase::common::ObSzString(index->build_stats_.algo_), "knn_degree", index->build_stats_.knn_degree_,
+                 "graph_degree", index->build_stats_.graph_degree_, "knn_us", index->build_stats_.knn_us_,
+                 "optimize_us", index->build_stats_.optimize_us_, "load_us", index->build_stats_.load_us_,
+                 "host_threads", index->build_stats_.threads_,
                  "cost_us", elapsed_us(start), KCSTRING(capability().device_name));
       }
 #else
@@ -1236,6 +1556,10 @@ int serialize(CagraIndex *index, std::ostream &out)
         LOG_WARN("hipvs graph build before serialize failed", K(build_ret), K(index->count()));
       } else {
         LOG_INFO("hipvs graph built before serialize", K(index->count()), K(index->config_.dim),
+                 "algo", ::oceanbase::common::ObSzString(index->build_stats_.algo_), "knn_degree", index->build_stats_.knn_degree_,
+                 "graph_degree", index->build_stats_.graph_degree_, "knn_us", index->build_stats_.knn_us_,
+                 "optimize_us", index->build_stats_.optimize_us_, "load_us", index->build_stats_.load_us_,
+                 "host_threads", index->build_stats_.threads_,
                  "cost_us", elapsed_us(start), KCSTRING(capability().device_name));
       }
 #else
